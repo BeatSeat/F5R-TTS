@@ -9,7 +9,6 @@ from importlib.resources import files
 
 import torch
 import torchaudio
-from accelerate import Accelerator
 from tqdm import tqdm
 
 from f5_tts.eval.utils_eval import (
@@ -20,9 +19,10 @@ from f5_tts.eval.utils_eval import (
 from f5_tts.infer.utils_infer import load_checkpoint, load_vocoder
 from f5_tts.model import CFM, DiT, UNetT
 from f5_tts.model.utils import get_tokenizer
+from f5_tts.model.megatron_engine import MegatronEngine
 
-accelerator = Accelerator()
-device = f"cuda:{accelerator.process_index}"
+engine = MegatronEngine(log_with=None, gradient_accumulation_steps=1)
+device = engine.device
 
 
 # --------------------- Dataset Settings -------------------- #
@@ -157,15 +157,15 @@ def main():
     dtype = torch.float32 if mel_spec_type == "bigvgan" else None
     model = load_checkpoint(model, ckpt_path, device, dtype=dtype, use_ema=use_ema)
 
-    if not os.path.exists(output_dir) and accelerator.is_main_process:
+    if not os.path.exists(output_dir) and engine.is_main_process:
         os.makedirs(output_dir)
 
     # start batch inference
-    accelerator.wait_for_everyone()
+    engine.wait_for_everyone()
     start = time.time()
 
-    with accelerator.split_between_processes(prompts_all) as prompts:
-        for prompt in tqdm(prompts, disable=not accelerator.is_local_main_process):
+    with engine.split_between_processes(prompts_all) as prompts:
+        for prompt in tqdm(prompts, disable=not engine.is_local_main_process):
             utts, ref_rms_list, ref_mels, ref_mel_lens, total_mel_lens, final_text_list = prompt
             ref_mels = ref_mels.to(device)
             ref_mel_lens = torch.tensor(ref_mel_lens, dtype=torch.long).to(device)
@@ -197,8 +197,8 @@ def main():
                         generated_wave = generated_wave * ref_rms_list[i] / target_rms
                     torchaudio.save(f"{output_dir}/{utts[i]}.wav", generated_wave.squeeze(0).cpu(), target_sample_rate)
 
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
+    engine.wait_for_everyone()
+    if engine.is_main_process:
         timediff = time.time() - start
         print(f"Done batch inference in {timediff / 60 :.2f} minutes.")
 

@@ -73,17 +73,24 @@ python ./src/f5_tts/infer/infer_cli.py \
 
 You can download [SenseVoice_small](https://huggingface.co/FunAudioLLM/SenseVoiceSmall) and [wespeaker](https://wenet.org.cn/downloads?models=wespeaker&version=cnceleb_resnet34.zip) for GRPO phase.
 If you want to use our code directly, you need to place the reference model in `ckpts/F5TTS_ref`. if not, you can change the loading method in `src/rl/trainer_rl.py`.
-```bash
-accelerate config
 
+Edit the provided `.env` file before launching training:
+
+- populate `MASTER_ADDR`, `MASTER_PORT`, and optional world-size variables for multi-node setups;
+- add your `F5R_TTS_HF_REPO_ID` and `HF_TOKEN` (or `F5R_TTS_HF_TOKEN`) to push checkpoints to the Hugging Face Hub automatically;
+- provide a `WANDB_API_KEY` (and optional project/run overrides) so experiment tracking can authenticate during training;
+- adjust dataset split overrides or logging backends as needed.
+
+Both pretraining and RL launch scripts load `.env` automatically, so `torchrun` picks up the values without extra shell exports.
+```bash
 # Data preparing
 python src/f5_tts/train/datasets/prepare_emilia.py
 
 # Pretraining phase
-accelerate launch rc/f5_tts/train/train.py
+torchrun --standalone --nproc_per_node=1 src/f5_tts/train/train.py
 
 # GRPO phase
-accelerate launch rc/f5_tts/train/train_rl.py
+torchrun --standalone --nproc_per_node=1 src/f5_tts/train/train_rl.py
 ```
 
 ## [Evaluation](src/f5_tts/eval)

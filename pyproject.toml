@@ -14,7 +14,6 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    "accelerate>=0.33.0",
     "bitsandbytes>0.37.0",
     "cached_path",
     "click",
@@ -27,6 +26,7 @@ dependencies = [
     "librosa",
     "matplotlib",
     "numpy<=1.26.4",
+    "python-dotenv",
     "pydub",
     "pypinyin",
     "safetensors",
@@ -42,6 +42,9 @@ dependencies = [
     "wandb",
     "wespeaker",
     "x_transformers>=1.31.14",
+    "megatron-core>=0.8.0",
+    "verl>=0.5.0",
+    "huggingface_hub>=0.23.0",
 ]
 
 [project.optional-dependencies]

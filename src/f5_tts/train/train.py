@@ -1,6 +1,11 @@
 # training script.
 
 from importlib.resources import files
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
 
 from f5_tts.model import CFM, DiT, Trainer, UNetT
 from f5_tts.model.dataset import load_dataset
@@ -101,3 +106,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
