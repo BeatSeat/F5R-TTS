@@ -7,16 +7,17 @@ import os
 import torch
 import torchaudio
 import wandb
-from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
 from ema_pytorch import EMA
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset, IterableDataset, SequentialSampler
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from f5_tts.model import CFM
 from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
+from f5_tts.model.hf_hub_utils import push_checkpoint_to_hub
+from f5_tts.model.megatron_engine import MegatronEngine
 from f5_tts.model.utils import default, exists
 
 # trainer
@@ -44,23 +45,20 @@ class Trainer:
         wandb_resume_id: str = None,
         log_samples: bool = False,
         last_per_steps=None,
-        accelerate_kwargs: dict = dict(),
+        megatron_kwargs: dict | None = None,
         ema_kwargs: dict = dict(),
         bnb_optimizer: bool = False,
         mel_spec_type: str = "vocos",  # "vocos" | "bigvgan"
     ):
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-
         if logger == "wandb" and not wandb.api.api_key:
             logger = None
         print(f"Using logger: {logger}")
         self.log_samples = log_samples
 
-        self.accelerator = Accelerator(
+        self.accelerator = MegatronEngine(
             log_with=logger if logger == "wandb" else None,
-            kwargs_handlers=[ddp_kwargs],
             gradient_accumulation_steps=grad_accumulation_steps,
-            **accelerate_kwargs,
+            megatron_kwargs=megatron_kwargs,
         )
 
         self.logger = logger
@@ -132,7 +130,7 @@ class Trainer:
         if self.is_main:
             checkpoint = dict(
                 model_state_dict=self.accelerator.unwrap_model(self.model).state_dict(),
-                optimizer_state_dict=self.accelerator.unwrap_model(self.optimizer).state_dict(),
+                optimizer_state_dict=self.optimizer.state_dict(),
                 ema_model_state_dict=self.ema_model.state_dict(),
                 step=step,
             )
@@ -141,10 +139,14 @@ class Trainer:
             if not os.path.exists(self.checkpoint_path):
                 os.makedirs(self.checkpoint_path)
             if last:
-                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_last.pt")
+                checkpoint_path = os.path.join(self.checkpoint_path, "model_last.pt")
+                self.accelerator.save(checkpoint, checkpoint_path)
                 print(f"Saved last checkpoint at step {step}")
             else:
-                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_{step}.pt")
+                checkpoint_path = os.path.join(self.checkpoint_path, f"model_{step}.pt")
+                self.accelerator.save(checkpoint, checkpoint_path)
+
+            push_checkpoint_to_hub(checkpoint_path, step=step, last=last)
 
     def load_checkpoint(self):
         if (
@@ -170,7 +172,7 @@ class Trainer:
 
         if "step" in checkpoint:
             self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
-            self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint["optimizer_state_dict"])
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             if self.scheduler and "scheduler_state_dict" in checkpoint:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             step = checkpoint["step"]
@@ -259,7 +261,7 @@ class Trainer:
         else:
             warmup_steps = (
                 self.num_warmup_updates * self.accelerator.num_processes
-            )  # consider a fixed warmup steps while using accelerate multi-gpu ddp
+            )  # consider fixed warmup steps while using Megatron multi-GPU training
             total_steps = dataloader_length * self.epochs / self.grad_accumulation_steps
             decay_steps = max(total_steps - warmup_steps, 1)
             warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps)
@@ -288,6 +290,14 @@ class Trainer:
             skipped_epoch = 0
 
         for epoch in range(skipped_epoch, self.epochs):
+            sampler = getattr(train_dataloader, "sampler", None)
+            if isinstance(sampler, DistributedSampler):
+                sampler.set_epoch(epoch)
+
+            batch_sampler = getattr(train_dataloader, "batch_sampler", None)
+            if hasattr(batch_sampler, "set_epoch"):
+                batch_sampler.set_epoch(epoch)
+
             self.model.train()
             if skipped_dataloader is not None and epoch == skipped_epoch:
                 progress_bar = tqdm(

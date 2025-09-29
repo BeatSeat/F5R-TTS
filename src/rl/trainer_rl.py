@@ -8,8 +8,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.data
-from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
 from einops import rearrange
 from ema_pytorch import EMA
 from f5_tts.model import CFM, DiT
@@ -19,8 +17,17 @@ from f5_tts.model.utils import (default, exists, get_tokenizer,
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset, IterableDataset, SequentialSampler
+from torch.utils.data.distributed import DistributedSampler
 
 from rl import reward
+from f5_tts.model.hf_hub_utils import push_checkpoint_to_hub
+from f5_tts.model.megatron_engine import MegatronEngine
+from verl.trainer.ppo.core_algos import (
+    AdvantageEstimator,
+    compute_rewards,
+    get_adv_estimator_fn,
+    get_policy_loss_fn,
+)
 
 
 def mask_from_frac_lengths(seq_len, frac_lengths):
@@ -88,17 +95,18 @@ class GRPOTrainer():
         wandb_run_name="test_run",
         wandb_resume_id: str = None,
         last_per_steps=None,
-        accelerate_kwargs: dict = None,
-        ema_kwargs: dict = None
+        megatron_kwargs: dict | None = None,
+        ema_kwargs: dict | None = None,
+        policy_loss: str = "gpg",
+        adv_estimator: AdvantageEstimator = AdvantageEstimator.GRPO,
+        kl_penalty: float = 0.1,
     ):
+        ema_kwargs = ema_kwargs or {}
 
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-
-        self.accelerator = Accelerator(
+        self.accelerator = MegatronEngine(
             log_with="wandb",
-            kwargs_handlers=[ddp_kwargs],
             gradient_accumulation_steps=grad_accumulation_steps,
-            **accelerate_kwargs
+            megatron_kwargs=megatron_kwargs,
         )
 
         if exists(wandb_resume_id):
@@ -122,6 +130,11 @@ class GRPOTrainer():
 
         self.repeat_count = 8
         self.mini_repeat_count = 1
+        self.policy_loss_name = policy_loss
+        self.adv_estimator = adv_estimator
+        self.kl_penalty = kl_penalty
+        if self.policy_loss_name != "gpg":
+            raise ValueError("Only 'gpg' policy loss is currently supported with the verl integration.")
 
         self.model = model
 
@@ -172,7 +185,7 @@ class GRPOTrainer():
         if self.is_main:
             checkpoint = dict(
                 model_state_dict=self.accelerator.unwrap_model(self.model).state_dict(),
-                optimizer_state_dict=self.accelerator.unwrap_model(self.optimizer).state_dict(),
+                optimizer_state_dict=self.optimizer.state_dict(),
                 ema_model_state_dict=self.ema_model.state_dict(),
                 step=step
             )
@@ -181,10 +194,14 @@ class GRPOTrainer():
             if not os.path.exists(self.checkpoint_path):
                 os.makedirs(self.checkpoint_path)
             if last:
-                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_last.pt")
+                checkpoint_path = os.path.join(self.checkpoint_path, "model_last.pt")
+                self.accelerator.save(checkpoint, checkpoint_path)
                 print(f"Saved last checkpoint at step {step}")
             else:
-                self.accelerator.save(checkpoint, f"{self.checkpoint_path}/model_{step}.pt")
+                checkpoint_path = os.path.join(self.checkpoint_path, f"model_{step}.pt")
+                self.accelerator.save(checkpoint, checkpoint_path)
+
+            push_checkpoint_to_hub(checkpoint_path, step=step, last=last)
 
     def load_checkpoint(self):
         if not exists(self.checkpoint_path):
@@ -209,7 +226,7 @@ class GRPOTrainer():
 
         if 'step' in checkpoint:
             self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint['model_state_dict'])
-            self.accelerator.unwrap_model(self.optimizer).load_state_dict(checkpoint['optimizer_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if self.scheduler:
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             step = checkpoint['step']
@@ -222,6 +239,29 @@ class GRPOTrainer():
         del checkpoint
         gc.collect()
         return step
+
+    def _collect_log_prob(self, trajectory_stats: list[list[torch.Tensor]]) -> torch.Tensor:
+        if not trajectory_stats:
+            return torch.zeros((0, 1), device=self.accelerator.device)
+
+        log_probs = []
+        for entry in trajectory_stats:
+            if len(entry) < 3:
+                continue
+            flow_state, mu, log_sig = entry
+            log_prob = (
+                -F.mse_loss(mu, flow_state, reduction="none")
+                / (2 * (torch.exp(log_sig) ** 2) + 1e-6)
+                - log_sig
+            )
+            log_prob = log_prob.view(log_prob.size(0), -1).mean(dim=-1)
+            log_probs.append(log_prob)
+
+        if not log_probs:
+            batch = trajectory_stats[0][1].shape[0]
+            return torch.zeros((batch, 1), device=self.accelerator.device)
+
+        return torch.stack(log_probs, dim=1)
 
     def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
 
@@ -311,6 +351,14 @@ class GRPOTrainer():
             skipped_epoch = 0
 
         for epoch in range(skipped_epoch, self.epochs):
+            sampler = getattr(train_dataloader, "sampler", None)
+            if isinstance(sampler, DistributedSampler):
+                sampler.set_epoch(epoch)
+
+            batch_sampler = getattr(train_dataloader, "batch_sampler", None)
+            if hasattr(batch_sampler, "set_epoch"):
+                batch_sampler.set_epoch(epoch)
+
             self.model.train()
             if exists(resumable_with_seed) and epoch == skipped_epoch:
                 progress_bar = tqdm(
@@ -339,13 +387,13 @@ class GRPOTrainer():
                         dur_loss = self.duration_predictor(mel_spec, lens=batch.get('durations'))
                         self.accelerator.log({"duration loss": dur_loss.item()}, step=global_step)
 
-                    frac_lengths = torch.zeros((mel_spec.size(0),), device=self.model.device)
+                    frac_lengths = torch.zeros((mel_spec.size(0),), device=self.accelerator.device)
                     frac_lengths = frac_lengths.float().uniform_(*(0.1, 0.3))
-                    prompt_idx, trg_idx = mask_from_frac_lengths(mel_lengths, frac_lengths)
+                    prompt_idx, _ = mask_from_frac_lengths(mel_lengths, frac_lengths)
                     prompt_idx = prompt_idx.unsqueeze(-1)
                     prompt_idx = prompt_idx.repeat(1, 1, 100)
                     prompt_audio = mel_spec[prompt_idx].view(mel_spec.size(0), -1, mel_spec.size(2))
-                    out, _, pro_result = self.model.module.forward_rl(
+                    out, _, pro_result = self.accelerator.unwrap_model(self.model).forward_rl(
                         cond=prompt_audio,
                         text=text_inputs,
                         duration=mel_lengths,
@@ -354,7 +402,7 @@ class GRPOTrainer():
                         sway_sampling_coef=-1.0,
                     )
                     with torch.no_grad():
-                        _, _, ref_pro_result = self.ref_model.module.forward_rl(
+                        _, _, ref_pro_result = self.accelerator.unwrap_model(self.ref_model).forward_rl(
                             cond=prompt_audio,
                             text=text_inputs,
                             duration=mel_lengths,
@@ -373,41 +421,37 @@ class GRPOTrainer():
                     sim, acc = reward.get_reward(out, mel_spec)
                     rewards = sim * 1.0 + acc * 3.0
 
-                    # Compute grouped-wise rewards
-                    rewards_list = rewards.view(-1).tolist()
-                    rewards_list = [str(item) for item in rewards_list]
-                    with open("./{}".format(rewards.device), "w") as f:
-                        f.write("\n".join(rewards_list))
-                    self.accelerator.wait_for_everyone()
-                    rewards_list = []
-                    for i in range(torch.cuda.device_count()):
-                        temp = []
-                        with open(f"cuda:{i}") as f:
-                            for line in f.readlines():
-                                line = line.strip("\n")
-                                temp.append(float(line))
-                        rewards_list.append(temp)
-                    mean = torch.from_numpy(np.mean(rewards_list, axis=0)).to(rewards.device).to(rewards.dtype)
-                    std = torch.from_numpy(np.std(rewards_list, axis=0)).to(rewards.device).to(rewards.dtype)
-                    advantages = (rewards - mean) / (std + 1e-4)
+                    log_prob = self._collect_log_prob(pro_result)
+                    ref_log_prob = self._collect_log_prob(ref_pro_result)
+                    if log_prob.numel() == 0:
+                        continue
 
-                    pro_advantages = []
-                    for x, mu, log_sig in pro_result:
-                        p = torch.exp(- F.mse_loss(mu, x, reduction='none') / (2 * (torch.exp(log_sig) ** 2)))
-                        p = p / torch.exp(log_sig)
-                        pro_advantages.append(p)
-                    pro_advantages = torch.stack(pro_advantages, dim=1)
-                    advantages = advantages.view(advantages.size(0), 1, 1, 1)
-                    pro_advantages = pro_advantages * advantages
-                    trg_idx = trg_idx.unsqueeze(-1)
-                    trg_idx = trg_idx.unsqueeze(1)
-                    trg_idx = trg_idx.repeat(1, pro_advantages.size(1), 1, pro_advantages.size(-1))
-                    pro_advantages = pro_advantages[trg_idx]
-                    pro_advantages = pro_advantages.mean()
+                    response_mask = torch.ones_like(log_prob, device=log_prob.device)
+                    token_scores = rewards.unsqueeze(-1).expand_as(log_prob).detach()
+                    token_level_rewards = compute_rewards(
+                        token_scores,
+                        log_prob.detach(),
+                        ref_log_prob.detach(),
+                        self.kl_penalty,
+                    )
 
-                    loss_kl = reward.get_kl(pro_result, ref_pro_result)
-                    loss_kl = loss_kl.mean()
-                    loss = - pro_advantages + loss_kl
+                    adv_fn = get_adv_estimator_fn(self.adv_estimator)
+                    advantages, _ = adv_fn(
+                        token_level_rewards,
+                        response_mask,
+                        index=np.arange(log_prob.size(0)),
+                    )
+
+                    policy_loss_fn = get_policy_loss_fn(self.policy_loss_name)
+                    pg_loss, _, policy_kl, _ = policy_loss_fn(
+                        ref_log_prob.detach(),
+                        log_prob,
+                        advantages,
+                        response_mask,
+                        config=None,
+                    )
+
+                    loss = pg_loss
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
@@ -427,7 +471,11 @@ class GRPOTrainer():
                 global_step += 1
 
                 if self.accelerator.is_local_main_process:
-                    self.accelerator.log({"loss": loss.item(), "lr": current_lr}, step=global_step)
+                    kl_value = policy_kl.item() if torch.is_tensor(policy_kl) else float(policy_kl)
+                    self.accelerator.log(
+                        {"loss": loss.item(), "lr": current_lr, "kl": kl_value},
+                        step=global_step,
+                    )
 
                 progress_bar.set_postfix(step=str(global_step), loss=loss.item())
 

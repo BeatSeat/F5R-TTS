@@ -23,7 +23,6 @@ To run batch inference for evaluations, execute the following commands:
 
 ```bash
 # batch inference for evaluations
-accelerate config  # if not set before
 bash src/f5_tts/eval/eval_infer_batch.sh
 ```
 

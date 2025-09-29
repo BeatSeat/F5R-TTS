@@ -1,9 +1,15 @@
 from importlib.resources import files
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 from f5_tts.model import CFM, DiT
 from f5_tts.model.utils import get_tokenizer
 from f5_tts.model.dataset import load_dataset
 from rl import trainer_rl
+
+
+load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
 
 
 # -------------------------- Dataset Settings --------------------------- #
