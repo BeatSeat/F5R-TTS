@@ -1,4 +1,5 @@
 import json
+import os
 import random
 from importlib.resources import files
 
@@ -6,9 +7,10 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 from datasets import Dataset as Dataset_
-from datasets import load_from_disk
+from datasets import load_dataset as hf_load_dataset
+from datasets import load_dataset_builder, load_from_disk
 from torch import nn
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset, IterableDataset, Sampler
 from tqdm import tqdm
 
 from f5_tts.model.modules import MelSpec
@@ -78,6 +80,87 @@ class HFDataset(Dataset):
             mel_spec=mel_spec,
             text=text,
         )
+
+
+class StreamingHFDataset(IterableDataset):
+    """Dataset wrapper for streaming Hugging Face datasets."""
+
+    def __init__(
+        self,
+        hf_dataset,
+        *,
+        dataset_length: int | None = None,
+        target_sample_rate=24_000,
+        n_mel_channels=100,
+        hop_length=256,
+        n_fft=1024,
+        win_length=1024,
+        mel_spec_type="vocos",
+    ):
+        self.dataset = hf_dataset
+        self.dataset_length = dataset_length
+        self.target_sample_rate = target_sample_rate
+        self.hop_length = hop_length
+
+        self.mel_spectrogram = MelSpec(
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            n_mel_channels=n_mel_channels,
+            target_sample_rate=target_sample_rate,
+            mel_spec_type=mel_spec_type,
+        )
+
+    @property
+    def num_examples(self) -> int | None:
+        return self.dataset_length
+
+    def __len__(self):
+        if self.dataset_length is None:
+            raise TypeError("Streaming dataset does not expose a static length")
+        return self.dataset_length
+
+    def __iter__(self):
+        for row in self.dataset:
+            audio_info = row.get("audio")
+            if audio_info is None:
+                continue
+
+            if isinstance(audio_info, dict):
+                audio_array = audio_info.get("array")
+                sample_rate = audio_info.get("sampling_rate")
+            else:
+                audio_array = getattr(audio_info, "array", None)
+                sample_rate = getattr(audio_info, "sampling_rate", None)
+
+            if audio_array is None or sample_rate is None:
+                continue
+
+            audio_tensor = torch.as_tensor(audio_array).float()
+            if audio_tensor.ndim == 1:
+                audio_tensor = audio_tensor.unsqueeze(0)
+            elif audio_tensor.ndim > 1:
+                audio_tensor = torch.mean(audio_tensor, dim=0, keepdim=True)
+
+            duration = audio_tensor.shape[-1] / sample_rate
+            if duration > 30 or duration < 0.3:
+                continue
+
+            if sample_rate != self.target_sample_rate:
+                resampler = torchaudio.transforms.Resample(sample_rate, self.target_sample_rate)
+                audio_tensor = resampler(audio_tensor)
+
+            mel_spec = self.mel_spectrogram(audio_tensor)
+            mel_spec = mel_spec.squeeze(0)
+
+            text = row.get("text")
+            if text is None:
+                continue
+
+            yield dict(
+                mel_spec=mel_spec,
+                text=text,
+            )
 
 
 class CustomDataset(Dataset):
@@ -159,6 +242,75 @@ class CustomDataset(Dataset):
 # Dynamic Batch Sampler
 
 
+def _resolve_streaming_dataset(dataset_name: str):
+    """Return Hugging Face streaming configuration if dataset should stream."""
+
+    if os.environ.get("F5R_TTS_DISABLE_HF_STREAMING"):
+        return None
+
+    name_lower = dataset_name.lower()
+
+    if name_lower.startswith("emilia"):
+        languages = dataset_name.split("_")[1:]
+        default_split = "train"
+        if languages:
+            lang_suffix = ".".join(lang.lower() for lang in languages)
+            default_split = f"train.{lang_suffix}"
+
+        split = os.environ.get("F5R_TTS_EMILIA_SPLIT", default_split)
+        return dict(
+            repo_id="amphion/Emilia-Dataset",
+            split=split,
+            load_kwargs={},
+            builder_kwargs={},
+        )
+
+    if name_lower.startswith("wenetspeech4tts"):
+        parts = dataset_name.split("_")
+        tier = parts[1] if len(parts) > 1 else "Premium"
+        config_name = os.environ.get("F5R_TTS_WENETSPEECH_CONFIG", tier.lower())
+        split = os.environ.get("F5R_TTS_WENETSPEECH_SPLIT", "train")
+        return dict(
+            repo_id="amphion/WenetSpeech4TTS",
+            split=split,
+            load_kwargs={"name": config_name},
+            builder_kwargs={"name": config_name},
+        )
+
+    if name_lower.startswith("rl"):
+        repo_id = os.environ.get("F5R_TTS_RL_REPO_ID", "amphion/F5-TTS-RL")
+        split = os.environ.get("F5R_TTS_RL_SPLIT", "train")
+
+        config_name = os.environ.get("F5R_TTS_RL_CONFIG")
+        if "_" in dataset_name:
+            _, maybe_config = dataset_name.split("_", 1)
+            if maybe_config:
+                config_name = config_name or maybe_config.lower()
+
+        load_kwargs = {}
+        builder_kwargs = {}
+        if config_name:
+            load_kwargs["name"] = config_name
+            builder_kwargs["name"] = config_name
+
+        num_examples = os.environ.get("F5R_TTS_RL_NUM_EXAMPLES")
+        if num_examples is not None:
+            try:
+                num_examples = int(num_examples)
+            except ValueError:
+                num_examples = None
+
+        return dict(
+            repo_id=repo_id,
+            split=split,
+            load_kwargs=load_kwargs,
+            builder_kwargs=builder_kwargs,
+            num_examples=num_examples,
+        )
+
+    return None
+
+
 class DynamicBatchSampler(Sampler[list[int]]):
     def __init__(
         self, sampler: Sampler[int], frames_threshold: int, max_samples=0, random_seed=None, drop_last: bool = False,
@@ -235,7 +387,7 @@ def load_dataset(
     audio_type: str = "raw",
     mel_spec_module: nn.Module | None = None,
     mel_spec_kwargs: dict = dict(),
-) -> CustomDataset | HFDataset:
+) -> CustomDataset | HFDataset | StreamingHFDataset:
     """
     dataset_type    - "CustomDataset" if you want to use tokenizer name and default data path to load for train_dataset
                     - "CustomDatasetPath" if you just want to pass the full path to a preprocessed dataset without relying on tokenizer
@@ -243,7 +395,33 @@ def load_dataset(
 
     print("Loading dataset ...")
 
-    if dataset_type == "CustomDataset":
+    streaming_cfg = _resolve_streaming_dataset(dataset_name)
+    if streaming_cfg is not None:
+        repo_id = streaming_cfg["repo_id"]
+        split = streaming_cfg["split"]
+        load_kwargs = streaming_cfg.get("load_kwargs", {})
+        builder_kwargs = streaming_cfg.get("builder_kwargs", {})
+
+        print(f"Loading Hugging Face dataset '{repo_id}' (split: '{split}') in streaming mode...")
+        hf_dataset = hf_load_dataset(repo_id, split=split, streaming=True, **load_kwargs)
+
+        dataset_length = streaming_cfg.get("num_examples")
+        if dataset_length is None:
+            try:
+                builder = load_dataset_builder(repo_id, **builder_kwargs)
+                if split in builder.info.splits:
+                    dataset_length = builder.info.splits[split].num_examples
+            except Exception as exc:  # pragma: no cover - network/auth dependent
+                print(f"Warning: unable to determine dataset length for {repo_id}:{split} ({exc})")
+                dataset_length = None
+
+        train_dataset = StreamingHFDataset(
+            hf_dataset,
+            dataset_length=dataset_length,
+            **mel_spec_kwargs,
+        )
+
+    elif dataset_type == "CustomDataset":
         rel_data_path = str(files("f5_tts").joinpath(f"../../data/{dataset_name}_{tokenizer}"))
         if audio_type == "raw":
             try:
