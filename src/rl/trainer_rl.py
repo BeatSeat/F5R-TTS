@@ -1,4 +1,5 @@
 import gc
+import math
 import os
 import random
 from tqdm import tqdm
@@ -17,7 +18,7 @@ from f5_tts.model.utils import (default, exists, get_tokenizer,
                                 load_checkpoint, mask_from_start_end_indices)
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
-from torch.utils.data import DataLoader, Dataset, SequentialSampler
+from torch.utils.data import DataLoader, Dataset, IterableDataset, SequentialSampler
 
 from rl import reward
 
@@ -173,9 +174,10 @@ class GRPOTrainer():
                 model_state_dict=self.accelerator.unwrap_model(self.model).state_dict(),
                 optimizer_state_dict=self.accelerator.unwrap_model(self.optimizer).state_dict(),
                 ema_model_state_dict=self.ema_model.state_dict(),
-                scheduler_state_dict=self.scheduler.state_dict(),
                 step=step
             )
+            if self.scheduler is not None:
+                checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
             if not os.path.exists(self.checkpoint_path):
                 os.makedirs(self.checkpoint_path)
             if last:
@@ -229,7 +231,19 @@ class GRPOTrainer():
         else:
             generator = None
 
-        if self.batch_size_type == "sample":
+        is_streaming_dataset = isinstance(train_dataset, IterableDataset)
+
+        if is_streaming_dataset:
+            if self.batch_size_type != "sample" and self.accelerator.is_main_process:
+                print("Streaming dataset only supports sample-based batching. Falling back to 'sample'.")
+            train_dataloader = DataLoader(
+                train_dataset,
+                collate_fn=collate_fn,
+                num_workers=0,
+                pin_memory=True,
+                batch_size=self.batch_size,
+            )
+        elif self.batch_size_type == "sample":
             train_dataloader = DataLoader(
                 train_dataset, collate_fn=collate_fn, num_workers=num_workers, pin_memory=True,
                 persistent_workers=True, batch_size=self.batch_size, shuffle=True, generator=generator
@@ -250,24 +264,46 @@ class GRPOTrainer():
                 f"batch_size_type must be either 'sample' or 'frame', but received {self.batch_size_type}"
             )
 
-        #  accelerator.prepare() dispatches batches to devices;
-        #  which means the length of dataloader calculated before, should consider the number of devices
-        warmup_steps = self.num_warmup_updates * self.accelerator.num_processes
-        total_steps = len(train_dataloader) * self.epochs / self.grad_accumulation_steps
-        decay_steps = total_steps - warmup_steps
-        warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps)
-        decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_steps)
-        self.scheduler = SequentialLR(
-            self.optimizer,
-            schedulers=[warmup_scheduler, decay_scheduler],
-            milestones=[warmup_steps]
-        )
-        train_dataloader, self.scheduler = self.accelerator.prepare(train_dataloader, self.scheduler)
+        try:
+            dataloader_length = len(train_dataloader)
+        except TypeError:
+            dataloader_length = None
+
+        if dataloader_length is None and is_streaming_dataset:
+            dataset_size = getattr(train_dataset, "num_examples", None)
+            if dataset_size is not None:
+                dataloader_length = math.ceil(dataset_size / self.batch_size)
+
+        if dataloader_length is None:
+            print("Scheduler disabled: unable to determine the length of the streaming dataloader.")
+            self.scheduler = None
+            train_dataloader = self.accelerator.prepare(train_dataloader)
+        else:
+            #  accelerator.prepare() dispatches batches to devices;
+            #  which means the length of dataloader calculated before, should consider the number of devices
+            warmup_steps = self.num_warmup_updates * self.accelerator.num_processes
+            total_steps = dataloader_length * self.epochs / self.grad_accumulation_steps
+            decay_steps = max(total_steps - warmup_steps, 1)
+            warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps)
+            decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_steps)
+            self.scheduler = SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_scheduler, decay_scheduler],
+                milestones=[warmup_steps]
+            )
+            train_dataloader, self.scheduler = self.accelerator.prepare(train_dataloader, self.scheduler)
+
         start_step = self.load_checkpoint()
         global_step = start_step
 
-        if exists(resumable_with_seed):
-            orig_epoch_step = len(train_dataloader)
+        try:
+            epoch_length = len(train_dataloader)
+        except TypeError:
+            epoch_length = dataloader_length
+
+        skipped_dataloader = None
+        if exists(resumable_with_seed) and epoch_length is not None:
+            orig_epoch_step = epoch_length
             skipped_epoch = int(start_step // orig_epoch_step)
             skipped_batch = start_step % orig_epoch_step
             skipped_dataloader = self.accelerator.skip_first_batches(train_dataloader, num_batches=skipped_batch)
@@ -378,7 +414,11 @@ class GRPOTrainer():
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                     self.optimizer.step()
-                    self.scheduler.step()
+                    if self.scheduler:
+                        self.scheduler.step()
+                        current_lr = self.scheduler.get_last_lr()[0]
+                    else:
+                        current_lr = self.optimizer.param_groups[0]['lr']
                     self.optimizer.zero_grad()
 
                 if self.is_main:
@@ -387,7 +427,7 @@ class GRPOTrainer():
                 global_step += 1
 
                 if self.accelerator.is_local_main_process:
-                    self.accelerator.log({"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_step)
+                    self.accelerator.log({"loss": loss.item(), "lr": current_lr}, step=global_step)
 
                 progress_bar.set_postfix(step=str(global_step), loss=loss.item())
 
